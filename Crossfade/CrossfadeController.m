@@ -145,7 +145,6 @@ static const NSTimeInterval kHandoffWindow = 0.35;
     [self startTimer];
 }
 
-/* Called before VLCPlaybackService processes VLCMediaPlayerStateEnded. */
 - (void)primaryReachedEnd
 {
     if (!self.fading || !self.incoming)
@@ -155,7 +154,6 @@ static const NSTimeInterval kHandoffWindow = 0.35;
     [self stopTimer];
 }
 
-/* Called after VLCPlaybackService has handled the Ended state. */
 - (void)primaryStateChanged
 {
     if (!self.transitionPending || !self.incoming)
@@ -270,8 +268,6 @@ static const NSTimeInterval kHandoffWindow = 0.35;
     if (primaryTime < 0.0 || incomingTime < 0.0)
         return;
 
-    /* The primary player starts the next item for normal video rendering while
-     * the secondary player supplies its audio. Wait until their clocks meet. */
     if (!self.handoffFading && fabs(primaryTime - incomingTime) <= kHandoffWindow) {
         self.handoffFading = YES;
         self.handoffStart = CFAbsoluteTimeGetCurrent();
@@ -345,7 +341,8 @@ static const NSTimeInterval kHandoffWindow = 0.35;
     if (!player)
         return;
 
-    self.outgoingMedia = [outgoing valueForKey:@"media"];
+    @try { self.outgoingMedia = [outgoing valueForKey:@"media"]; }
+    @catch (__unused NSException *exception) { self.outgoingMedia = nil; }
     self.incomingMedia = media;
     self.incoming = player;
     self.fadeDuration = duration;
@@ -397,11 +394,9 @@ static const NSTimeInterval kHandoffWindow = 0.35;
 
 - (NSTimeInterval)remaining:(id)player
 {
-    NSTimeInterval total = 0.0;
-    NSTimeInterval current = 0.0;
     @try {
-        total = [[[player valueForKey:@"media"] valueForKey:@"length"] doubleValue] / 1000.0;
-        current = [[player valueForKey:@"time"] doubleValue] / 1000.0;
+        double total = [[[player valueForKey:@"media"] valueForKey:@"length"] doubleValue] / 1000.0;
+        double current = [[player valueForKey:@"time"] doubleValue] / 1000.0;
         float rate = [[player valueForKey:@"rate"] floatValue];
         if (rate <= 0.0)
             rate = 1.0;
@@ -445,7 +440,6 @@ static const NSTimeInterval kHandoffWindow = 0.35;
 
     @try {
         self.internalVolume = YES;
-        [[[player valueForKey:@"audio"] valueForKey:@"volume"] self];
         [[player valueForKey:@"audio"] setValue:@(MIN(MAX(value, 0), 200)) forKey:@"volume"];
         self.internalVolume = NO;
     }
