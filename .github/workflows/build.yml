@@ -31,14 +31,15 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           debs=(packages/*.deb)
-          dylibs=(.theos/obj/arm64/Crossfade.dylib)
-          test "${#debs[@]}" -eq 1
-          test "${#dylibs[@]}" -eq 1
-          dpkg-deb -I "${debs[0]}"
-          dpkg-deb -c "${debs[0]}"
-          file "${dylibs[0]}"
-          file "${debs[0]}"
-          ! dpkg-deb -c "${debs[0]}" | grep -E '(/jbroot|/var/jb)' || true
+          test "${#debs[@]}" -ge 1
+          crossfade_deb=(packages/com.videolan.vlc-ios.crossfade_*.deb)
+          test "${#crossfade_deb[@]}" -eq 1
+          test -f .theos/obj/arm64/Crossfade.dylib
+          dpkg-deb -I "${crossfade_deb[0]}"
+          dpkg-deb -c "${crossfade_deb[0]}"
+          file .theos/obj/arm64/Crossfade.dylib
+          file "${crossfade_deb[0]}"
+          ! dpkg-deb -c "${crossfade_deb[0]}" | grep -E '(/jbroot|/var/jb)' || true
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:

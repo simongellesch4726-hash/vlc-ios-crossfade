@@ -10,9 +10,6 @@ Crossfade_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 Crossfade_FRAMEWORKS = Foundation UIKit AVFoundation
 Crossfade_LIBRARIES = substrate
 Crossfade_INSTALL_PATH = /Library/MobileSubstrate/DynamicLibraries
-
 INSTALL_TARGET_PROCESSES = VLC
-SUBPROJECTS += Preferences
 
 include $(THEOS_MAKE_PATH)/tweak.mk
-include $(THEOS_MAKE_PATH)/aggregate.mk
