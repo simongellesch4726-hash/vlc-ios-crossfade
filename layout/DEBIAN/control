@@ -1,0 +1,9 @@
+Package: com.videolan.vlc-ios.crossfade.preferences
+Name: VLC Audio Crossfade Preferences
+Version: 1.0.1
+Architecture: iphoneos-arm64e
+Description: Preferences bundle for VLC Audio Crossfade.
+Maintainer: Private
+Author: Private
+Section: Tweaks
+Depends: preferenceloader
