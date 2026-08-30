@@ -40,26 +40,6 @@
     %orig;
 }
 
-- (void)mediaPlayerStateChanged:(NSNotification *)notification {
-    (void)notification;
-
-    id player = nil;
-    @try { player = [(id)self valueForKey:@"_mediaPlayer"]; }
-    @catch (__unused NSException *exception) {}
-
-    NSInteger state = -1;
-    @try { state = [[player valueForKey:@"state"] integerValue]; }
-    @catch (__unused NSException *exception) {}
-
-    if (state == 3)
-        [[CrossfadeController sharedController] primaryReachedEnd];
-
-    %orig;
-
-    if (state == 3)
-        [[CrossfadeController sharedController] primaryStateChanged];
-}
-
 %end
 
 %hook VLCAudio
