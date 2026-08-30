@@ -421,6 +421,17 @@ static void *PlayerHandle(id player)
     return YES;
 }
 
+- (BOOL)preparePrimaryPlayer:(id)player
+{
+    if (!self.state || ![self ensureEngine] || ![self installCallbacksOnPlayer:player incoming:NO])
+        return NO;
+
+    atomic_store_explicit(&self.state->primary.active, true, memory_order_release);
+    atomic_store_explicit(&self.state->primaryGain, 0.0f, memory_order_release);
+    RingReset(&self.state->primary);
+    return YES;
+}
+
 - (BOOL)prepareIncomingPlayer:(id)incoming
 {
     if (!self.state || ![self ensureEngine] || ![self installCallbacksOnPlayer:incoming incoming:YES])
@@ -454,6 +465,20 @@ static void *PlayerHandle(id player)
 {
     if (self.state)
         atomic_store_explicit(&self.state->incoming.active, active, memory_order_release);
+}
+
+- (void)stopPrimaryPlayer:(id)primary
+{
+    if (self.state) {
+        atomic_store_explicit(&self.state->primary.active, false, memory_order_release);
+        RingReset(&self.state->primary);
+    }
+
+    if (primary && [primary respondsToSelector:@selector(stop)]) {
+        void (*stop)(id, SEL) = (void *)objc_msgSend;
+        stop(primary, @selector(stop));
+    }
+    self.primaryHandle = NULL;
 }
 
 - (void)stopIncomingPlayer:(id)incoming
