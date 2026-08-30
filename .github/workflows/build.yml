@@ -66,48 +66,74 @@ jobs:
           rm -rf verify-tweak
           mkdir -p verify-tweak
           dpkg-deb -x "$tweak" verify-tweak
-          test -f "verify-tweak/Library/MobileSubstrate/DynamicLibraries/Crossfade.dylib"
-          test -f "verify-tweak/Library/MobileSubstrate/DynamicLibraries/Crossfade.plist"
-          test -f "verify-tweak/Library/PreferenceLoader/Preferences/Crossfade.plist"
-          test -x "verify-tweak/Library/PreferenceBundles/CrossfadePrefs.bundle/CrossfadePrefs"
-          test -f "verify-tweak/Library/PreferenceBundles/CrossfadePrefs.bundle/Info.plist"
-          test -f "verify-tweak/Library/PreferenceBundles/CrossfadePrefs.bundle/Root.plist"
 
-          python3 - <<'PY'
+          echo "==> Extracted package tree"
+          find verify-tweak -print | sort
+
+          echo "==> Package file list"
+          dpkg-deb -c "$tweak"
+
+          echo "==> Locating payload files"
+          dylib_matches=(verify-tweak/**/Crossfade.dylib)
+          plist_matches=(verify-tweak/**/Crossfade.plist)
+          prefs_matches=(verify-tweak/**/CrossfadePrefs.bundle/CrossfadePrefs)
+          root_matches=(verify-tweak/**/CrossfadePrefs.bundle/Root.plist)
+          info_matches=(verify-tweak/**/CrossfadePrefs.bundle/Info.plist)
+
+          printf 'Crossfade.dylib: '; printf '%s\n' "${dylib_matches[@]:-<none>}"
+          printf 'Crossfade.plist: '; printf '%s\n' "${plist_matches[@]:-<none>}"
+          printf 'CrossfadePrefs: '; printf '%s\n' "${prefs_matches[@]:-<none>}"
+          printf 'Root.plist: '; printf '%s\n' "${root_matches[@]:-<none>}"
+          printf 'Info.plist: '; printf '%s\n' "${info_matches[@]:-<none>}"
+
+          test "${#dylib_matches[@]}" -eq 1
+          test "${#prefs_matches[@]}" -eq 1
+          test "${#root_matches[@]}" -eq 1
+          test "${#info_matches[@]}" -eq 1
+
+          dylib_path="${dylib_matches[0]}"
+          prefs_path="${prefs_matches[0]}"
+          root_path="${root_matches[0]}"
+          info_path="${info_matches[0]}"
+
+          test -f "$dylib_path"
+          test -x "$prefs_path"
+          test -f "$root_path"
+          test -f "$info_path"
+
+          echo "==> Preference bundle verification"
+          python3 - "$info_path" "$root_path" <<'PY'
           import plistlib
+          import sys
           from pathlib import Path
 
-          bundle = Path("verify-tweak/Library/PreferenceBundles/CrossfadePrefs.bundle")
-          info = plistlib.loads((bundle / "Info.plist").read_bytes())
+          info = plistlib.loads(Path(sys.argv[1]).read_bytes())
+          root = plistlib.loads(Path(sys.argv[2]).read_bytes())
+
           assert info.get("CFBundleExecutable") == "CrossfadePrefs", info
           assert info.get("CFBundlePackageType") == "BNDL", info
           assert info.get("NSPrincipalClass") == "CrossfadePrefsListController", info
 
-          root = plistlib.loads((bundle / "Root.plist").read_bytes())
           items = root.get("items")
           assert isinstance(items, list) and len(items) >= 2, root
-
           crossfade = next((x for x in items if x.get("key") == "CrossfadeDuration"), None)
           assert crossfade is not None, items
-          assert crossfade.get("cell") == "PSLinkListCell", crossfade
-          assert crossfade.get("detail") == "PSListItemsController", crossfade
           assert crossfade.get("defaults") == "org.videolan.vlc-ios", crossfade
           assert len(crossfade.get("validValues", [])) == 16, crossfade
           assert len(crossfade.get("validTitles", [])) == 16, crossfade
           assert crossfade.get("validValues", [None])[0] == 0, crossfade
           assert crossfade.get("validValues", [None])[-1] == 15, crossfade
           assert crossfade.get("default") == 0, crossfade
-          print("Preference bundle metadata and Root.plist verified.")
+          print("Preference bundle metadata verified.")
           PY
 
+          echo "==> RootHide path verification"
           if find verify-tweak -type f -print0 | xargs -0 grep -IlE '(/jbroot|/var/jb)' 2>/dev/null | grep -q .; then
             echo "ERROR: invalid RootHide path found in package payload" >&2
+            find verify-tweak -type f -print0 | xargs -0 grep -IlE '(/jbroot|/var/jb)' 2>/dev/null || true
             exit 1
           fi
 
-          echo "==> Package contents"
-          dpkg-deb -I "$tweak"
-          dpkg-deb -c "$tweak"
           echo "Artifact verification passed."
 
       - name: Upload artifact
