@@ -1,7 +1,7 @@
 Package: com.videolan.vlc-ios.crossfade
 Name: VLC Audio Crossfade
-Version: 1.0.0
-Architecture: iphoneos-arm64
+Version: 1.0.1
+Architecture: iphoneos-arm64e
 Description: Audio-only crossfade for VLC for iOS 3.7.3 (build 475).
 Maintainer: Private
 Author: Private
