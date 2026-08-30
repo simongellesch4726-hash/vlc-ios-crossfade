@@ -43,7 +43,7 @@ static NSString * const kCrossfadeDurationKey = @"CrossfadeDuration";
     NSLog(@"[CrossfadePrefs] specifiers: loadSpecifiersFromPlistName returned %@ specifiers", @(loaded.count));
 
     if (loaded.count > 0) {
-        _specifiers = loaded;
+        _specifiers = [loaded mutableCopy];
         self.title = @"Audio Crossfade";
         return _specifiers;
     }
@@ -82,7 +82,7 @@ static NSString * const kCrossfadeDurationKey = @"CrossfadeDuration";
     PSSpecifier *crossfade = [PSSpecifier preferenceSpecifierNamed:@"Audio Crossfade"
                                                               target:self
                                                                   set:@selector(setPreferenceValue:specifier:)
-                                                                  get:@selector(readPreferenceValue:)
+                                                                  get:@selector(readPreferenceValue:specifier:)
                                                                detail:NSClassFromString(@"PSListItemsController")
                                                                  cell:PSLinkListCell
                                                                  edit:nil];
