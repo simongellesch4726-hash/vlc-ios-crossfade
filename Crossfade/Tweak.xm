@@ -45,7 +45,7 @@
      * player can remain the audio source while the primary player opens the
      * next item for normal video playback. */
     id player = nil;
-    @try { player = [self valueForKey:@"_mediaPlayer"]; } @catch (__unused NSException *e) {}
+    @try { player = [(id)self valueForKey:@"_mediaPlayer"]; } @catch (__unused NSException *e) {}
     NSInteger state = -1;
     @try { state = [[player valueForKey:@"state"] integerValue]; } @catch (__unused NSException *e) {}
     if (state == 3)
