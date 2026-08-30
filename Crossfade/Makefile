@@ -6,7 +6,7 @@ THEOS_LAYOUT_DIR = layout
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = Crossfade
-Crossfade_FILES = Tweak.xm CrossfadeController.m
+Crossfade_FILES = Tweak.xm CrossfadeController.m CrossfadeAudioMixer.m
 Crossfade_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 Crossfade_FRAMEWORKS = Foundation UIKit AVFoundation
 Crossfade_LIBRARIES = substrate
