@@ -1,12 +1,15 @@
 #import "CrossfadeAudioMixer.h"
 #import <AVFoundation/AVFoundation.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
 
-/* libVLC 3.x callback API. Kept local so this tweak does not depend on the
- * private MobileVLCKit headers at build time. */
+/* libVLC 2.x/3.x decoded-audio callback API. The tweak resolves these symbols
+ * at runtime because MobileVLCKit is supplied by VLC itself. */
 typedef struct libvlc_media_player_t libvlc_media_player_t;
 typedef void (*libvlc_audio_play_cb)(void *data, const void *samples, unsigned count, int64_t pts);
 typedef void (*libvlc_audio_pause_cb)(void *data, int64_t pts);
@@ -14,95 +17,103 @@ typedef void (*libvlc_audio_resume_cb)(void *data, int64_t pts);
 typedef void (*libvlc_audio_flush_cb)(void *data, int64_t pts);
 typedef void (*libvlc_audio_drain_cb)(void *data);
 typedef void (*libvlc_audio_set_volume_cb)(void *data, float volume, bool mute);
-typedef int (*libvlc_audio_setup_cb)(void **opaque, char *format, unsigned *rate, unsigned *channels);
-typedef void (*libvlc_audio_cleanup_cb)(void *opaque);
 
-extern void libvlc_audio_set_callbacks(libvlc_media_player_t *, libvlc_audio_play_cb,
-                                       libvlc_audio_pause_cb, libvlc_audio_resume_cb,
-                                       libvlc_audio_flush_cb, libvlc_audio_drain_cb, void *);
-extern void libvlc_audio_set_format_callbacks(libvlc_media_player_t *, libvlc_audio_setup_cb,
-                                              libvlc_audio_cleanup_cb);
-extern void libvlc_audio_set_volume_callback(libvlc_media_player_t *, libvlc_audio_set_volume_cb);
+typedef void (*SetCallbacksFn)(libvlc_media_player_t *, libvlc_audio_play_cb,
+                               libvlc_audio_pause_cb, libvlc_audio_resume_cb,
+                               libvlc_audio_flush_cb, libvlc_audio_drain_cb, void *);
+typedef void (*SetFormatFn)(libvlc_media_player_t *, const char *, unsigned, unsigned);
+typedef void (*SetVolumeCallbackFn)(libvlc_media_player_t *, libvlc_audio_set_volume_cb);
 
-extern void *class_getInstanceMethod(Class cls, SEL sel);
+static SetCallbacksFn sSetCallbacks;
+static SetFormatFn sSetFormat;
+static SetVolumeCallbackFn sSetVolumeCallback;
+static dispatch_once_t sResolveOnce;
 
-static const NSUInteger kRingFrames = 48000 * 6;
-static const NSUInteger kMaxChannels = 2;
-
-@interface CrossfadeAudioBuffer : NSObject
-@property(nonatomic) uint32_t sampleRate;
-@property(nonatomic) uint32_t channels;
-@property(nonatomic) NSUInteger capacity;
-@property(nonatomic) float *samples;
-@property(nonatomic) _Atomic uint64_t writeFrame;
-@property(nonatomic) _Atomic uint64_t readFrame;
-@property(nonatomic) _Atomic BOOL flushing;
-- (void)configureRate:(uint32_t)rate channels:(uint32_t)channels;
-- (void)reset;
-- (void)pushFloat32:(const float *)samples frames:(NSUInteger)frames;
-- (NSUInteger)pullFloat32:(float *)out frames:(NSUInteger)frames;
-@end
-
-@implementation CrossfadeAudioBuffer
-
-- (instancetype)init
+static void ResolveLibVLCAudioAPI(void)
 {
-    self = [super init];
-    if (self) {
-        _capacity = kRingFrames;
-        _sampleRate = 48000;
-        _channels = 2;
-        _samples = calloc(_capacity * kMaxChannels, sizeof(float));
+    dispatch_once(&sResolveOnce, ^{
+        sSetCallbacks = (SetCallbacksFn)dlsym(RTLD_DEFAULT, "libvlc_audio_set_callbacks");
+        sSetFormat = (SetFormatFn)dlsym(RTLD_DEFAULT, "libvlc_audio_set_format");
+        sSetVolumeCallback = (SetVolumeCallbackFn)dlsym(RTLD_DEFAULT, "libvlc_audio_set_volume_callback");
+    });
+}
+
+#define CF_SAMPLE_RATE 48000u
+#define CF_CHANNELS 2u
+#define CF_RING_FRAMES (CF_SAMPLE_RATE * 8u)
+
+/* Single-producer/single-consumer ring. libVLC writes on its audio thread;
+ * AVAudioEngine consumes on its render thread. All storage is preallocated. */
+typedef struct {
+    float *data;
+    uint64_t capacity;
+    uint32_t channels;
+    _Atomic uint64_t readFrame;
+    _Atomic uint64_t writeFrame;
+    _Atomic bool active;
+} CrossfadeRing;
+
+typedef struct {
+    CrossfadeRing primary;
+    CrossfadeRing incoming;
+    _Atomic float primaryGain;
+    _Atomic float incomingGain;
+} CrossfadeMixerState;
+
+static bool RingInit(CrossfadeRing *ring, uint64_t capacity, uint32_t channels)
+{
+    ring->data = calloc((size_t)(capacity * channels), sizeof(float));
+    if (!ring->data)
+        return false;
+    ring->capacity = capacity;
+    ring->channels = channels;
+    atomic_init(&ring->readFrame, 0);
+    atomic_init(&ring->writeFrame, 0);
+    atomic_init(&ring->active, true);
+    return true;
+}
+
+static void RingDestroy(CrossfadeRing *ring)
+{
+    free(ring->data);
+    ring->data = NULL;
+}
+
+static void RingReset(CrossfadeRing *ring)
+{
+    atomic_store_explicit(&ring->readFrame, 0, memory_order_release);
+    atomic_store_explicit(&ring->writeFrame, 0, memory_order_release);
+}
+
+static void RingWrite(CrossfadeRing *ring, const float *samples, unsigned frames)
+{
+    if (!ring || !ring->data || !samples || frames == 0)
+        return;
+
+    uint64_t write = atomic_load_explicit(&ring->writeFrame, memory_order_relaxed);
+    uint64_t read = atomic_load_explicit(&ring->readFrame, memory_order_acquire);
+    uint64_t count = frames;
+
+    if (count > ring->capacity)
+        count = ring->capacity;
+
+    uint64_t used = write - read;
+    if (used > ring->capacity)
+        read = write - ring->capacity;
+
+    uint64_t freeFrames = ring->capacity - (write - read);
+    if (count > freeFrames) {
+        read += count - freeFrames;
+        atomic_store_explicit(&ring->readFrame, read, memory_order_release);
     }
-    return self;
-}
 
-- (void)dealloc
-{
-    free(_samples);
-}
-
-- (void)configureRate:(uint32_t)rate channels:(uint32_t)channels
-{
-    if (rate == 0 || channels == 0 || channels > kMaxChannels)
-        return;
-    if (_sampleRate == rate && _channels == channels)
-        return;
-    _sampleRate = rate;
-    _channels = channels;
-    [self reset];
-}
-
-- (void)reset
-{
-    atomic_store(&_writeFrame, 0);
-    atomic_store(&_readFrame, 0);
-    memset(_samples, 0, _capacity * kMaxChannels * sizeof(float));
-}
-
-- (void)pushFloat32:(const float *)samples frames:(NSUInteger)frames
-{
-    if (!samples || frames == 0)
-        return;
-
-    uint64_t write = atomic_load_explicit(&_writeFrame, memory_order_relaxed);
-    uint64_t read = atomic_load_explicit(&_readFrame, memory_order_acquire);
-
-    if (frames > _capacity)
-        frames = _capacity;
-
-    uint64_t available = _capacity - (write - read);
-    if (frames > available) {
-        uint64_t drop = frames - available;
-        read += drop;
-        atomic_store_explicit(&_readFrame, read, memory_order_release);
-    }
-
-    for (NSUInteger frame = 0; frame < frames; frame++) {
-        NSUInteger dstFrame = (NSUInteger)((write + frame) % _capacity);
-        const float *src = samples + frame * _channels;
-        float *dst = _samples + dstFrame * kMaxChannels;
-        if (_channels == 1) {
+    const uint32_t channels = ring->channels;
+    const uint64_t capacity = ring->capacity;
+    for (uint64_t frame = 0; frame < count; frame++) {
+        uint64_t dstFrame = (write + frame) % capacity;
+        float *dst = ring->data + dstFrame * channels;
+        const float *src = samples + frame * channels;
+        if (channels == 1) {
             dst[0] = src[0];
             dst[1] = src[0];
         } else {
@@ -111,106 +122,139 @@ static const NSUInteger kMaxChannels = 2;
         }
     }
 
-    atomic_store_explicit(&_writeFrame, write + frames, memory_order_release);
+    atomic_store_explicit(&ring->writeFrame, write + count, memory_order_release);
 }
 
-- (NSUInteger)pullFloat32:(float *)out frames:(NSUInteger)frames
+static uint64_t RingMixInterleaved(CrossfadeRing *ring, float *out, uint64_t frames, float gain)
 {
-    if (!out || frames == 0)
+    if (!ring || !ring->data || !out || frames == 0)
+        return 0;
+    if (!atomic_load_explicit(&ring->active, memory_order_acquire))
         return 0;
 
-    uint64_t read = atomic_load_explicit(&_readFrame, memory_order_relaxed);
-    uint64_t write = atomic_load_explicit(&_writeFrame, memory_order_acquire);
+    uint64_t read = atomic_load_explicit(&ring->readFrame, memory_order_relaxed);
+    uint64_t write = atomic_load_explicit(&ring->writeFrame, memory_order_acquire);
     uint64_t available = write - read;
-    NSUInteger count = (NSUInteger)MIN((uint64_t)frames, available);
+    uint64_t count = available < frames ? available : frames;
+    const uint64_t capacity = ring->capacity;
+    const uint32_t channels = ring->channels;
 
-    for (NSUInteger frame = 0; frame < count; frame++) {
-        NSUInteger srcFrame = (NSUInteger)((read + frame) % _capacity);
-        const float *src = _samples + srcFrame * kMaxChannels;
-        out[frame * 2] = src[0];
-        out[frame * 2 + 1] = src[1];
+    for (uint64_t frame = 0; frame < count; frame++) {
+        uint64_t srcFrame = (read + frame) % capacity;
+        const float *src = ring->data + srcFrame * channels;
+        if (channels == 1) {
+            out[frame * 2] += src[0] * gain;
+            out[frame * 2 + 1] += src[0] * gain;
+        } else {
+            out[frame * 2] += src[0] * gain;
+            out[frame * 2 + 1] += src[1] * gain;
+        }
     }
 
-    atomic_store_explicit(&_readFrame, read + count, memory_order_release);
+    atomic_store_explicit(&ring->readFrame, read + count, memory_order_release);
     return count;
 }
 
-@end
-
-@interface CrossfadeAudioMixer ()
-@property(nonatomic,strong) AVAudioEngine *engine;
-@property(nonatomic,strong) AVAudioSourceNode *sourceNode;
-@property(nonatomic,strong) CrossfadeAudioBuffer *primaryBuffer;
-@property(nonatomic,strong) CrossfadeAudioBuffer *incomingBuffer;
-@property(nonatomic) float primaryGain;
-@property(nonatomic) float incomingGain;
-@property(nonatomic) uint32_t sampleRate;
-@property(nonatomic) uint32_t channels;
-@property(nonatomic) BOOL configured;
-@property(nonatomic) BOOL engineRunning;
-@property(nonatomic) void *primaryHandle;
-@property(nonatomic) void *incomingHandle;
-@end
-
-static int AudioSetup(void **opaque, char *format, unsigned *rate, unsigned *channels)
+static uint64_t RingMixNonInterleaved(CrossfadeRing *ring, float *leftOut, float *rightOut,
+                                      uint64_t frames, float gain)
 {
-    CrossfadeAudioMixer *mixer = (__bridge CrossfadeAudioMixer *)(*opaque);
-    if (format)
-        memcpy(format, "FL32", 4);
-    if (rate)
-        *rate = mixer.sampleRate ?: 48000;
-    if (channels)
-        *channels = mixer.channels ?: 2;
-    return 0;
-}
+    if (!ring || !ring->data || !leftOut || !rightOut || frames == 0)
+        return 0;
+    if (!atomic_load_explicit(&ring->active, memory_order_acquire))
+        return 0;
 
-static void AudioCleanup(void *opaque)
-{
-    (void)opaque;
-}
+    uint64_t read = atomic_load_explicit(&ring->readFrame, memory_order_relaxed);
+    uint64_t write = atomic_load_explicit(&ring->writeFrame, memory_order_acquire);
+    uint64_t available = write - read;
+    uint64_t count = available < frames ? available : frames;
+    const uint64_t capacity = ring->capacity;
+    const uint32_t channels = ring->channels;
 
-static void AudioPlay(void *opaque, const void *samples, unsigned count, int64_t pts)
-{
-    (void)pts;
-    CrossfadeAudioMixer *mixer = (__bridge CrossfadeAudioMixer *)opaque;
-    if (!mixer || !samples || count == 0)
-        return;
-
-    CrossfadeAudioBuffer *buffer = nil;
-    if (mixer.primaryHandle) {
-        /* The callback data is the mixer itself; which player generated the
-         * callback is determined by the private bridge installed for each
-         * player. */
+    for (uint64_t frame = 0; frame < count; frame++) {
+        uint64_t srcFrame = (read + frame) % capacity;
+        const float *src = ring->data + srcFrame * channels;
+        if (channels == 1) {
+            leftOut[frame] += src[0] * gain;
+            rightOut[frame] += src[0] * gain;
+        } else {
+            leftOut[frame] += src[0] * gain;
+            rightOut[frame] += src[1] * gain;
+        }
     }
+
+    atomic_store_explicit(&ring->readFrame, read + count, memory_order_release);
+    return count;
 }
 
 static void AudioPlayPrimary(void *opaque, const void *samples, unsigned count, int64_t pts)
 {
     (void)pts;
-    CrossfadeAudioMixer *mixer = (__bridge CrossfadeAudioMixer *)opaque;
-    [mixer.primaryBuffer pushFloat32:(const float *)samples frames:count];
+    CrossfadeMixerState *state = opaque;
+    RingWrite(&state->primary, samples, count);
 }
 
 static void AudioPlayIncoming(void *opaque, const void *samples, unsigned count, int64_t pts)
 {
     (void)pts;
-    CrossfadeAudioMixer *mixer = (__bridge CrossfadeAudioMixer *)(opaque);
-    [mixer.incomingBuffer pushFloat32:(const float *)samples frames:count];
+    CrossfadeMixerState *state = opaque;
+    RingWrite(&state->incoming, samples, count);
 }
 
-static void AudioNoopPause(void *opaque, int64_t pts) { (void)opaque; (void)pts; }
-static void AudioNoopResume(void *opaque, int64_t pts) { (void)opaque; (void)pts; }
-static void AudioFlush(void *opaque, int64_t pts)
+static void AudioPausePrimary(void *opaque, int64_t pts)
 {
     (void)pts;
-    CrossfadeAudioMixer *mixer = (__bridge CrossfadeAudioMixer *)opaque;
-    if (!mixer)
-        return;
-    [mixer.primaryBuffer reset];
-    [mixer.incomingBuffer reset];
+    CrossfadeMixerState *state = opaque;
+    atomic_store_explicit(&state->primary.active, false, memory_order_release);
+    RingReset(&state->primary);
 }
+
+static void AudioPauseIncoming(void *opaque, int64_t pts)
+{
+    (void)pts;
+    CrossfadeMixerState *state = opaque;
+    atomic_store_explicit(&state->incoming.active, false, memory_order_release);
+    RingReset(&state->incoming);
+}
+
+static void AudioResumePrimary(void *opaque, int64_t pts)
+{
+    (void)pts;
+    CrossfadeMixerState *state = opaque;
+    atomic_store_explicit(&state->primary.active, true, memory_order_release);
+}
+
+static void AudioResumeIncoming(void *opaque, int64_t pts)
+{
+    (void)pts;
+    CrossfadeMixerState *state = opaque;
+    atomic_store_explicit(&state->incoming.active, true, memory_order_release);
+}
+
+static void AudioFlushPrimary(void *opaque, int64_t pts)
+{
+    (void)pts;
+    CrossfadeMixerState *state = opaque;
+    RingReset(&state->primary);
+}
+
+static void AudioFlushIncoming(void *opaque, int64_t pts)
+{
+    (void)pts;
+    CrossfadeMixerState *state = opaque;
+    RingReset(&state->incoming);
+}
+
 static void AudioDrain(void *opaque) { (void)opaque; }
 static void AudioVolume(void *opaque, float volume, bool mute) { (void)opaque; (void)volume; (void)mute; }
+
+@interface CrossfadeAudioMixer ()
+@property(nonatomic,strong) AVAudioEngine *engine;
+@property(nonatomic,strong) AVAudioSourceNode *sourceNode;
+@property(nonatomic) CrossfadeMixerState *state;
+@property(nonatomic) void *primaryHandle;
+@property(nonatomic) void *incomingHandle;
+@property(nonatomic) BOOL engineRunning;
+@end
 
 @implementation CrossfadeAudioMixer
 
@@ -225,15 +269,66 @@ static void AudioVolume(void *opaque, float volume, bool mute) { (void)opaque; (
 - (instancetype)init
 {
     self = [super init];
-    if (self) {
-        _primaryBuffer = [CrossfadeAudioBuffer new];
-        _incomingBuffer = [CrossfadeAudioBuffer new];
-        _primaryGain = 1.0f;
-        _incomingGain = 0.0f;
-        _sampleRate = 48000;
-        _channels = 2;
+    if (!self)
+        return nil;
+
+    _state = calloc(1, sizeof(*_state));
+    if (!_state)
+        return nil;
+
+    if (!RingInit(&_state->primary, CF_RING_FRAMES, CF_CHANNELS) ||
+        !RingInit(&_state->incoming, CF_RING_FRAMES, CF_CHANNELS)) {
+        RingDestroy(&_state->primary);
+        RingDestroy(&_state->incoming);
+        free(_state);
+        _state = NULL;
+        return nil;
     }
+
+    atomic_init(&_state->primaryGain, 1.0f);
+    atomic_init(&_state->incomingGain, 0.0f);
     return self;
+}
+
+- (void)dealloc
+{
+    [self detach];
+    if (_state) {
+        RingDestroy(&_state->primary);
+        RingDestroy(&_state->incoming);
+        free(_state);
+        _state = NULL;
+    }
+}
+
+- (void)renderIntoAudioBufferList:(AudioBufferList *)audioBufferList frameCount:(AVAudioFrameCount)frameCount
+{
+    CrossfadeMixerState *state = self.state;
+    if (!state || !audioBufferList || frameCount == 0)
+        return;
+
+    float primaryGain = atomic_load_explicit(&state->primaryGain, memory_order_relaxed);
+    float incomingGain = atomic_load_explicit(&state->incomingGain, memory_order_relaxed);
+    NSUInteger buffers = audioBufferList->mNumberBuffers;
+    uint64_t frames = frameCount;
+
+    if (buffers == 1 && audioBufferList->mBuffers[0].mNumberChannels >= 2) {
+        float *out = audioBufferList->mBuffers[0].mData;
+        if (!out)
+            return;
+        memset(out, 0, (size_t)(frames * 2 * sizeof(float)));
+        RingMixInterleaved(&state->primary, out, frames, primaryGain);
+        RingMixInterleaved(&state->incoming, out, frames, incomingGain);
+    } else if (buffers >= 2) {
+        float *left = audioBufferList->mBuffers[0].mData;
+        float *right = audioBufferList->mBuffers[1].mData;
+        if (!left || !right)
+            return;
+        memset(left, 0, (size_t)(frames * sizeof(float)));
+        memset(right, 0, (size_t)(frames * sizeof(float)));
+        RingMixNonInterleaved(&state->primary, left, right, frames, primaryGain);
+        RingMixNonInterleaved(&state->incoming, left, right, frames, incomingGain);
+    }
 }
 
 - (BOOL)ensureEngine
@@ -243,170 +338,175 @@ static void AudioVolume(void *opaque, float volume, bool mute) { (void)opaque; (
 
     AVAudioSession *session = [AVAudioSession sharedInstance];
     NSError *error = nil;
-    [session setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeDefault options:0 error:&error];
-    if (error)
-        return NO;
     [session setActive:YES error:&error];
     if (error)
         return NO;
 
-    self.engine = [AVAudioEngine new];
-    AVAudioFormat *format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:self.sampleRate channels:2];
-    __weak CrossfadeAudioMixer *weakSelf = self;
-    self.sourceNode = [[AVAudioSourceNode alloc] initWithRenderBlock:^OSStatus(BOOL *isSilence,
-                                                                                const AudioTimeStamp *timestamp,
-                                                                                AVAudioFrameCount frameCount,
-                                                                                AudioBufferList *audioBufferList) {
+    AVAudioEngine *engine = [AVAudioEngine new];
+    AVAudioFormat *format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:CF_SAMPLE_RATE
+                                                                              channels:CF_CHANNELS];
+    __unsafe_unretained CrossfadeAudioMixer *unsafeSelf = self;
+    AVAudioSourceNode *sourceNode = [[AVAudioSourceNode alloc] initWithFormat:format
+                                                                  renderBlock:^OSStatus(BOOL *isSilence,
+                                                                                        const AudioTimeStamp *timestamp,
+                                                                                        AVAudioFrameCount frameCount,
+                                                                                        AudioBufferList *audioBufferList) {
         (void)timestamp;
-        CrossfadeAudioMixer *strongSelf = weakSelf;
-        if (!strongSelf) {
+        if (!unsafeSelf) {
             *isSilence = YES;
             return noErr;
         }
-
-        float *out = (float *)audioBufferList->mBuffers[0].mData;
-        NSUInteger frames = frameCount;
-        float *primary = calloc(frames * 2, sizeof(float));
-        float *incoming = calloc(frames * 2, sizeof(float));
-        NSUInteger p = [strongSelf.primaryBuffer pullFloat32:primary frames:frames];
-        NSUInteger i = [strongSelf.incomingBuffer pullFloat32:incoming frames:frames];
-
-        if (audioBufferList->mNumberBuffers == 1) {
-            for (NSUInteger frame = 0; frame < frames; frame++) {
-                float left = 0.0f;
-                float right = 0.0f;
-                if (frame < p) {
-                    left += primary[frame * 2] * strongSelf.primaryGain;
-                    right += primary[frame * 2 + 1] * strongSelf.primaryGain;
-                }
-                if (frame < i) {
-                    left += incoming[frame * 2] * strongSelf.incomingGain;
-                    right += incoming[frame * 2 + 1] * strongSelf.incomingGain;
-                }
-                out[frame * 2] = left;
-                out[frame * 2 + 1] = right;
-            }
-        } else {
-            float *leftOut = (float *)audioBufferList->mBuffers[0].mData;
-            float *rightOut = (float *)audioBufferList->mBuffers[1].mData;
-            for (NSUInteger frame = 0; frame < frames; frame++) {
-                float left = 0.0f;
-                float right = 0.0f;
-                if (frame < p) {
-                    left += primary[frame * 2] * strongSelf.primaryGain;
-                    right += primary[frame * 2 + 1] * strongSelf.primaryGain;
-                }
-                if (frame < i) {
-                    left += incoming[frame * 2] * strongSelf.incomingGain;
-                    right += incoming[frame * 2 + 1] * strongSelf.incomingGain;
-                }
-                leftOut[frame] = left;
-                rightOut[frame] = right;
-            }
-        }
-
-        free(primary);
-        free(incoming);
-        *isSilence = (p == 0 && i == 0);
+        [unsafeSelf renderIntoAudioBufferList:audioBufferList frameCount:frameCount];
+        *isSilence = NO;
         return noErr;
     }];
 
-    [self.engine attachNode:self.sourceNode];
-    [self.engine connect:self.sourceNode to:self.engine.mainMixerNode format:format];
-    if (![self.engine startAndReturnError:&error])
+    [engine attachNode:sourceNode];
+    [engine connect:sourceNode to:engine.mainMixerNode format:format];
+    if (![engine startAndReturnError:&error])
         return NO;
 
+    self.engine = engine;
+    self.sourceNode = sourceNode;
     self.engineRunning = YES;
     return YES;
 }
 
-- (void)installCallbacksOnPlayer:(id)player incoming:(BOOL)incoming
+static void *PlayerHandle(id player)
 {
     if (!player)
-        return;
+        return NULL;
 
-    void *handle = NULL;
-    @try {
-        handle = [player valueForKey:@"playerInstance"] ? (void *)[[player valueForKey:@"playerInstance"] pointerValue] : NULL;
-    } @catch (__unused NSException *exception) {
-        handle = NULL;
+    SEL selector = NSSelectorFromString(@"playerInstance");
+    if ([player respondsToSelector:selector]) {
+        void *(*getter)(id, SEL) = (void *)objc_msgSend;
+        return getter(player, selector);
     }
 
-    if (!handle) {
-        Class cls = object_getClass(player);
-        Ivar ivar = class_getInstanceVariable(cls, "_playerInstance");
-        if (ivar)
-            handle = *(void **)((uint8_t *)(__bridge void *)player + ivar_getOffset(ivar));
+    selector = NSSelectorFromString(@"libVLCMediaPlayer");
+    if ([player respondsToSelector:selector]) {
+        void *(*getter)(id, SEL) = (void *)objc_msgSend;
+        return getter(player, selector);
     }
 
+    Class cls = object_getClass(player);
+    Ivar ivar = class_getInstanceVariable(cls, "_playerInstance");
+    if (!ivar)
+        return NULL;
+
+    return *(void **)((uint8_t *)(__bridge void *)player + ivar_getOffset(ivar));
+}
+
+- (BOOL)installCallbacksOnPlayer:(id)player incoming:(BOOL)incoming
+{
+    void *handle = PlayerHandle(player);
     if (!handle)
-        return;
+        return NO;
 
-    libvlc_audio_set_format_callbacks(handle, AudioSetup, AudioCleanup);
+    ResolveLibVLCAudioAPI();
+    if (!sSetCallbacks || !sSetFormat)
+        return NO;
+
+    /* Force a common decoded format so both streams can be mixed without a
+     * resampler in our real-time callback. libVLC performs the conversion. */
+    sSetFormat(handle, "FL32", CF_SAMPLE_RATE, CF_CHANNELS);
+
+    CrossfadeMixerState *state = self.state;
     if (incoming) {
-        libvlc_audio_set_callbacks(handle, AudioPlayIncoming, AudioNoopPause, AudioNoopResume,
-                                   AudioFlush, AudioDrain, (__bridge void *)self);
+        sSetCallbacks(handle, AudioPlayIncoming, AudioPauseIncoming, AudioResumeIncoming,
+                      AudioFlushIncoming, AudioDrain, state);
         self.incomingHandle = handle;
     } else {
-        libvlc_audio_set_callbacks(handle, AudioPlayPrimary, AudioNoopPause, AudioNoopResume,
-                                   AudioFlush, AudioDrain, (__bridge void *)self);
+        sSetCallbacks(handle, AudioPlayPrimary, AudioPausePrimary, AudioResumePrimary,
+                      AudioFlushPrimary, AudioDrain, state);
         self.primaryHandle = handle;
     }
-    libvlc_audio_set_volume_callback(handle, AudioVolume);
+
+    if (sSetVolumeCallback)
+        sSetVolumeCallback(handle, AudioVolume);
+
+    return YES;
 }
 
 - (BOOL)attachPrimaryPlayer:(id)primary
 {
-    if (![self ensureEngine])
+    if (!self.state || ![self ensureEngine] || ![self installCallbacksOnPlayer:primary incoming:NO])
         return NO;
-    [self installCallbacksOnPlayer:primary incoming:NO];
-    [self.primaryBuffer reset];
-    return self.primaryHandle != NULL;
+
+    atomic_store_explicit(&self.state->primary.active, true, memory_order_release);
+    atomic_store_explicit(&self.state->primaryGain, 1.0f, memory_order_release);
+    atomic_store_explicit(&self.state->incomingGain, 0.0f, memory_order_release);
+    RingReset(&self.state->primary);
+    RingReset(&self.state->incoming);
+    return YES;
 }
 
 - (BOOL)prepareIncomingPlayer:(id)incoming
 {
-    if (![self ensureEngine])
+    if (!self.state || ![self ensureEngine] || ![self installCallbacksOnPlayer:incoming incoming:YES])
         return NO;
-    [self installCallbacksOnPlayer:incoming incoming:YES];
-    [self.incomingBuffer reset];
-    return self.incomingHandle != NULL;
+
+    atomic_store_explicit(&self.state->incoming.active, true, memory_order_release);
+    atomic_store_explicit(&self.state->incomingGain, 0.0f, memory_order_release);
+    RingReset(&self.state->incoming);
+    return YES;
 }
 
 - (void)setPrimaryGain:(float)gain
 {
-    _primaryGain = MAX(0.0f, MIN(gain, 1.0f));
+    if (self.state)
+        atomic_store_explicit(&self.state->primaryGain, MAX(0.0f, MIN(gain, 2.0f)), memory_order_release);
 }
 
 - (void)setIncomingGain:(float)gain
 {
-    _incomingGain = MAX(0.0f, MIN(gain, 1.0f));
+    if (self.state)
+        atomic_store_explicit(&self.state->incomingGain, MAX(0.0f, MIN(gain, 2.0f)), memory_order_release);
+}
+
+- (void)setPrimaryActive:(BOOL)active
+{
+    if (self.state)
+        atomic_store_explicit(&self.state->primary.active, active, memory_order_release);
+}
+
+- (void)setIncomingActive:(BOOL)active
+{
+    if (self.state)
+        atomic_store_explicit(&self.state->incoming.active, active, memory_order_release);
 }
 
 - (void)stopIncomingPlayer:(id)incoming
 {
-    if (!incoming)
-        return;
-    @try { [incoming performSelector:@selector(stop)]; } @catch (__unused NSException *exception) {}
+    atomic_store_explicit(&self.state->incoming.active, false, memory_order_release);
+    RingReset(&self.state->incoming);
+    if (incoming && [incoming respondsToSelector:@selector(stop)]) {
+        void (*stop)(id, SEL) = (void *)objc_msgSend;
+        stop(incoming, @selector(stop));
+    }
     self.incomingHandle = NULL;
-    [self.incomingBuffer reset];
 }
 
 - (void)detach
 {
-    [self.primaryBuffer reset];
-    [self.incomingBuffer reset];
+    if (!_state)
+        return;
+
+    atomic_store_explicit(&_state->primary.active, false, memory_order_release);
+    atomic_store_explicit(&_state->incoming.active, false, memory_order_release);
+    RingReset(&_state->primary);
+    RingReset(&_state->incoming);
+    atomic_store_explicit(&_state->primaryGain, 1.0f, memory_order_release);
+    atomic_store_explicit(&_state->incomingGain, 0.0f, memory_order_release);
     self.primaryHandle = NULL;
     self.incomingHandle = NULL;
-    self.primaryGain = 1.0f;
-    self.incomingGain = 0.0f;
 
     if (self.engineRunning) {
         [self.engine stop];
         self.engineRunning = NO;
     }
-    self.engine = nil;
     self.sourceNode = nil;
+    self.engine = nil;
 }
 
 @end
