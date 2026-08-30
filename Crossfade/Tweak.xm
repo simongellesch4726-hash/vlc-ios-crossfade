@@ -2,6 +2,7 @@
 #import "CrossfadeController.h"
 
 %hook VLCPlaybackService
+
 - (void)startPlayback {
     %orig;
     CrossfadeController *c = [CrossfadeController sharedController];
@@ -40,14 +41,16 @@
 }
 
 - (void)mediaPlayerStateChanged:(NSNotification *)notification {
-    /* VLCMediaPlayerStateEnded is 3 in MobileVLCKit 3.x. Handle it before
-     * VLCPlaybackService advances the list player so the secondary audio
-     * player can remain the audio source while the primary player opens the
-     * next item for normal video playback. */
+    (void)notification;
+
     id player = nil;
-    @try { player = [(id)self valueForKey:@"_mediaPlayer"]; } @catch (__unused NSException *e) {}
+    @try { player = [(id)self valueForKey:@"_mediaPlayer"]; }
+    @catch (__unused NSException *exception) {}
+
     NSInteger state = -1;
-    @try { state = [[player valueForKey:@"state"] integerValue]; } @catch (__unused NSException *e) {}
+    @try { state = [[player valueForKey:@"state"] integerValue]; }
+    @catch (__unused NSException *exception) {}
+
     if (state == 3)
         [[CrossfadeController sharedController] primaryReachedEnd];
 
@@ -56,11 +59,14 @@
     if (state == 3)
         [[CrossfadeController sharedController] primaryStateChanged];
 }
+
 %end
 
 %hook VLCAudio
+
 - (void)setVolume:(int)volume {
     %orig;
     [[CrossfadeController sharedController] userVolumeChanged:volume];
 }
+
 %end
