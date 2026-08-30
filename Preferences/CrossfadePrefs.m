@@ -49,7 +49,7 @@ static NSString * const kCrossfadeDurationKey = @"CrossfadeDuration";
     }
 
     NSLog(@"[CrossfadePrefs] ERROR: Root.plist produced no specifiers; using programmatic fallback");
-    _specifiers = [self fallbackSpecifiers];
+    _specifiers = [[self fallbackSpecifiers] mutableCopy];
     return _specifiers;
 }
 
