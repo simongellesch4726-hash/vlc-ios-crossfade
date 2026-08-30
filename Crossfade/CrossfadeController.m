@@ -1,4 +1,5 @@
 #import "CrossfadeController.h"
+#import "CrossfadeAudioMixer.h"
 #import <AVFoundation/AVFoundation.h>
 #import <objc/message.h>
 #import <float.h>
@@ -7,13 +8,14 @@
 static NSString * const kDurationKey = @"CrossfadeDuration";
 static const NSInteger kRepeatCurrent = 1;
 static const NSInteger kRepeatAll = 2;
-static const NSTimeInterval kHandoffWindow = 0.35;
+static const NSTimeInterval kHandoffRamp = 0.18;
+static const NSTimeInterval kHandoffTolerance = 0.20;
+static const NSTimeInterval kMaxHandoffWait = 3.0;
 
 @interface CrossfadeController ()
 @property(nonatomic,weak) id service;
 @property(nonatomic,strong) id primary;
 @property(nonatomic,strong) id incoming;
-@property(nonatomic,strong) id outgoingMedia;
 @property(nonatomic,strong) id incomingMedia;
 @property(nonatomic,strong) NSTimer *timer;
 @property(nonatomic,strong) NSTimer *handoffTimer;
@@ -22,9 +24,11 @@ static const NSTimeInterval kHandoffWindow = 0.35;
 @property(nonatomic) BOOL paused;
 @property(nonatomic) BOOL internalVolume;
 @property(nonatomic) BOOL handoffFading;
+@property(nonatomic) BOOL mixerAttached;
 @property(nonatomic) NSInteger volume;
 @property(nonatomic) NSTimeInterval fadeDuration;
-@property(nonatomic) NSTimeInterval handoffStart;
+@property(nonatomic) NSTimeInterval handoffStarted;
+@property(nonatomic) NSTimeInterval handoffTargetTime;
 @end
 
 @implementation CrossfadeController
@@ -52,56 +56,72 @@ static const NSTimeInterval kHandoffWindow = 0.35;
 - (void)dealloc
 {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
-    [self cancel:YES];
+    [self cancelTransition:YES];
+    [[CrossfadeAudioMixer sharedMixer] detach];
 }
 
 - (NSTimeInterval)duration
 {
-    double value = [[NSUserDefaults standardUserDefaults] doubleForKey:kDurationKey];
-    return isfinite(value) ? MIN(MAX(value, 0.0), 15.0) : 0.0;
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (![defaults objectForKey:kDurationKey])
+        return 0.0;
+
+    double value = [defaults doubleForKey:kDurationKey];
+    if (!isfinite(value))
+        return 0.0;
+    return MIN(MAX(value, 0.0), 15.0);
 }
 
 - (void)attachToPlaybackService:(id)service
 {
-    self.service = service;
-    if (!service)
-        return;
+    if (self.service != service)
+        [self cancelTransition:YES];
 
-    @try { self.primary = [service valueForKey:@"_mediaPlayer"]; }
-    @catch (__unused NSException *exception) { self.primary = nil; }
+    self.service = service;
+    self.primary = [self servicePlayer];
 
     if (!self.primary) {
-        @try { self.primary = [service valueForKey:@"mediaPlayer"]; }
-        @catch (__unused NSException *exception) {}
+        self.mixerAttached = NO;
+        return;
     }
 
-    NSInteger currentVolume = [self volumeOf:self.primary];
-    if (currentVolume > 0)
-        self.volume = currentVolume;
-
+    self.volume = [self volumeOf:self.primary];
+    self.mixerAttached = [[CrossfadeAudioMixer sharedMixer] attachPrimaryPlayer:self.primary];
+    [[CrossfadeAudioMixer sharedMixer] setPrimaryGain:[self gainForVolume:self.volume]];
+    [[CrossfadeAudioMixer sharedMixer] setIncomingGain:0.0];
     [self startTimer];
 }
 
 - (void)detach
 {
-    [self cancel:YES];
+    [self cancelTransition:YES];
     [self stopTimer];
     [self stopHandoffTimer];
+    [[CrossfadeAudioMixer sharedMixer] detach];
+    self.mixerAttached = NO;
     self.service = nil;
     self.primary = nil;
 }
 
 - (void)playbackStarted
 {
-    if (self.service) {
-        @try { self.primary = [self.service valueForKey:@"_mediaPlayer"]; }
-        @catch (__unused NSException *exception) {}
+    id player = [self servicePlayer];
+    if (player && player != self.primary) {
+        [self cancelTransition:YES];
+        self.primary = player;
+        self.mixerAttached = [[CrossfadeAudioMixer sharedMixer] attachPrimaryPlayer:player];
     }
+
+    if (!self.primary)
+        self.primary = player;
 
     if (self.primary && !self.fading && !self.incoming) {
         NSInteger currentVolume = [self volumeOf:self.primary];
-        if (currentVolume > 0)
+        if (currentVolume >= 0)
             self.volume = currentVolume;
+        [[CrossfadeAudioMixer sharedMixer] setPrimaryActive:YES];
+        [[CrossfadeAudioMixer sharedMixer] setPrimaryGain:[self gainForVolume:self.volume]];
+        [[CrossfadeAudioMixer sharedMixer] setIncomingGain:0.0];
     }
 
     [self startTimer];
@@ -109,14 +129,18 @@ static const NSTimeInterval kHandoffWindow = 0.35;
 
 - (void)playbackStopped
 {
-    [self cancel:YES];
+    [self cancelTransition:YES];
     [self stopTimer];
     [self stopHandoffTimer];
+    [[CrossfadeAudioMixer sharedMixer] detach];
+    self.mixerAttached = NO;
 }
 
 - (void)playbackPaused:(BOOL)paused
 {
     self.paused = paused;
+    [[CrossfadeAudioMixer sharedMixer] setPrimaryActive:!paused];
+    [[CrossfadeAudioMixer sharedMixer] setIncomingActive:!paused];
 
     if (paused) {
         [self call:self.incoming sel:@selector(pause)];
@@ -132,7 +156,7 @@ static const NSTimeInterval kHandoffWindow = 0.35;
 
 - (void)manualNavigation
 {
-    [self cancel:YES];
+    [self cancelTransition:YES];
     dispatch_async(dispatch_get_main_queue(), ^{
         [self playbackStarted];
     });
@@ -140,17 +164,22 @@ static const NSTimeInterval kHandoffWindow = 0.35;
 
 - (void)positionChanged
 {
-    if (self.fading || self.incoming)
-        [self cancel:YES];
+    if (self.fading || self.incoming || self.transitionPending)
+        [self cancelTransition:YES];
     [self startTimer];
 }
 
 - (void)primaryReachedEnd
 {
-    if (!self.fading || !self.incoming)
+    if (!self.incoming || !self.fading)
         return;
 
     self.transitionPending = YES;
+    self.handoffStarted = CFAbsoluteTimeGetCurrent();
+    self.handoffTargetTime = [self currentTime:self.incoming];
+    [[CrossfadeAudioMixer sharedMixer] setPrimaryGain:0.0];
+    [[CrossfadeAudioMixer sharedMixer] setIncomingGain:[self gainForVolume:self.volume]];
+    [[CrossfadeAudioMixer sharedMixer] setPrimaryActive:NO];
     [self stopTimer];
 }
 
@@ -158,7 +187,7 @@ static const NSTimeInterval kHandoffWindow = 0.35;
 {
     if (!self.transitionPending || !self.incoming)
         return;
-
+    self.handoffStarted = CFAbsoluteTimeGetCurrent();
     [self startHandoffTimer];
 }
 
@@ -168,25 +197,37 @@ static const NSTimeInterval kHandoffWindow = 0.35;
         return;
 
     self.volume = MIN(MAX(value, 0), 200);
+    float gain = [self gainForVolume:self.volume];
 
-    if (self.incoming) {
-        if (!self.handoffFading && self.transitionPending)
-            [self setVolume:self.volume player:self.incoming];
-    } else if (!self.fading) {
-        [self setVolume:self.volume player:self.primary];
+    if (self.fading) {
+        if (!self.handoffFading)
+            [[CrossfadeAudioMixer sharedMixer] setIncomingGain:MAX(0.0f, MIN(gain, 2.0f))];
+        return;
     }
+
+    if (self.transitionPending) {
+        [[CrossfadeAudioMixer sharedMixer] setIncomingGain:gain];
+        return;
+    }
+
+    [[CrossfadeAudioMixer sharedMixer] setPrimaryGain:gain];
+}
+
+- (float)gainForVolume:(NSInteger)value
+{
+    return MIN(MAX((float)value / 100.0f, 0.0f), 2.0f);
 }
 
 - (void)startTimer
 {
-    if (self.timer || self.paused || [self duration] <= 0.0 || self.transitionPending)
+    if (self.timer || self.paused || !self.mixerAttached || [self duration] <= 0.0 || self.transitionPending)
         return;
 
     self.timer = [NSTimer scheduledTimerWithTimeInterval:0.02
-                                                  target:self
-                                                selector:@selector(tick:)
-                                                userInfo:nil
-                                                 repeats:YES];
+                                                   target:self
+                                                 selector:@selector(tick:)
+                                                 userInfo:nil
+                                                  repeats:YES];
 }
 
 - (void)stopTimer
@@ -197,14 +238,14 @@ static const NSTimeInterval kHandoffWindow = 0.35;
 
 - (void)startHandoffTimer
 {
-    if (self.handoffTimer || self.paused || !self.incoming)
+    if (self.handoffTimer || self.paused || !self.incoming || !self.transitionPending)
         return;
 
     self.handoffTimer = [NSTimer scheduledTimerWithTimeInterval:0.02
-                                                         target:self
-                                                       selector:@selector(handoffTick:)
-                                                       userInfo:nil
-                                                        repeats:YES];
+                                                          target:self
+                                                        selector:@selector(handoffTick:)
+                                                        userInfo:nil
+                                                         repeats:YES];
 }
 
 - (void)stopHandoffTimer
@@ -216,37 +257,33 @@ static const NSTimeInterval kHandoffWindow = 0.35;
 - (void)tick:(NSTimer *)timer
 {
     (void)timer;
-
-    if (self.paused || !self.service || self.transitionPending)
+    if (self.paused || !self.service || !self.primary || self.transitionPending)
         return;
 
     NSTimeInterval duration = [self duration];
     if (duration <= 0.0) {
-        [self cancel:YES];
+        [self cancelTransition:YES];
         [self stopTimer];
         return;
     }
 
-    if (!self.primary) {
-        [self playbackStarted];
-        return;
-    }
-
     if (!self.fading) {
-        id outgoing = self.primary;
-        NSTimeInterval remaining = [self remaining:outgoing];
+        NSTimeInterval remaining = [self remaining:self.primary];
         if (remaining > 0.0 && remaining <= duration) {
             id next = [self nextMedia];
-            if (next)
-                [self begin:next outgoing:outgoing duration:duration];
+            if (next && [self begin:next duration:duration]) {
+                return;
+            }
         }
         return;
     }
 
     NSTimeInterval remaining = [self remaining:self.primary];
     CGFloat progress = (CGFloat)MIN(MAX(1.0 - remaining / self.fadeDuration, 0.0), 1.0);
-    [self setVolume:(NSInteger)llround(self.volume * (1.0 - progress)) player:self.primary];
-    [self setVolume:(NSInteger)llround(self.volume * progress) player:self.incoming];
+    CGFloat theta = progress * (CGFloat)(M_PI_2);
+    float baseGain = [self gainForVolume:self.volume];
+    [[CrossfadeAudioMixer sharedMixer] setPrimaryGain:baseGain * cosf(theta)];
+    [[CrossfadeAudioMixer sharedMixer] setIncomingGain:baseGain * sinf(theta)];
 }
 
 - (void)handoffTick:(NSTimer *)timer
@@ -256,42 +293,75 @@ static const NSTimeInterval kHandoffWindow = 0.35;
     if (self.paused || !self.incoming || !self.transitionPending || !self.primary)
         return;
 
-    id primaryMedia = nil;
-    @try { primaryMedia = [self.primary valueForKey:@"media"]; }
-    @catch (__unused NSException *exception) {}
-
-    if (!primaryMedia || !self.incomingMedia || [primaryMedia compare:self.incomingMedia] != NSOrderedSame)
+    id primaryMedia = [self mediaOf:self.primary];
+    if (!primaryMedia || !self.incomingMedia || [primaryMedia compare:self.incomingMedia] != NSOrderedSame) {
+        if (CFAbsoluteTimeGetCurrent() - self.handoffStarted > kMaxHandoffWait) {
+            [self abandonHandoffAndRestorePrimary];
+        }
         return;
-
-    NSTimeInterval primaryTime = [self currentTime:self.primary];
-    NSTimeInterval incomingTime = [self currentTime:self.incoming];
-    if (primaryTime < 0.0 || incomingTime < 0.0)
-        return;
-
-    if (!self.handoffFading && fabs(primaryTime - incomingTime) <= kHandoffWindow) {
-        self.handoffFading = YES;
-        self.handoffStart = CFAbsoluteTimeGetCurrent();
     }
 
-    if (!self.handoffFading)
+    BOOL seekable = [self boolValue:self.primary key:@"seekable" defaultValue:NO];
+    NSTimeInterval incomingTime = [self currentTime:self.incoming];
+    NSTimeInterval primaryTime = [self currentTime:self.primary];
+    if (incomingTime < 0.0 || primaryTime < 0.0) {
+        if (CFAbsoluteTimeGetCurrent() - self.handoffStarted > kMaxHandoffWait)
+            [self abandonHandoffAndRestorePrimary];
         return;
+    }
 
-    NSTimeInterval elapsed = CFAbsoluteTimeGetCurrent() - self.handoffStart;
-    CGFloat progress = (CGFloat)MIN(MAX(elapsed / 0.25, 0.0), 1.0);
-    [self setVolume:(NSInteger)llround(self.volume * progress) player:self.primary];
-    [self setVolume:(NSInteger)llround(self.volume * (1.0 - progress)) player:self.incoming];
+    if (!seekable) {
+        [self abandonHandoffAndRestorePrimary];
+        return;
+    }
+
+    if (fabs(primaryTime - incomingTime) > kHandoffTolerance || primaryTime < self.handoffTargetTime - kHandoffTolerance) {
+        [self setTime:incomingTime player:self.primary];
+        primaryTime = [self currentTime:self.primary];
+    }
+
+    if (!self.handoffFading) {
+        if (fabs(primaryTime - incomingTime) > kHandoffTolerance) {
+            if (CFAbsoluteTimeGetCurrent() - self.handoffStarted > kMaxHandoffWait)
+                [self abandonHandoffAndRestorePrimary];
+            return;
+        }
+        [[CrossfadeAudioMixer sharedMixer] setPrimaryActive:YES];
+        self.handoffFading = YES;
+        self.handoffStarted = CFAbsoluteTimeGetCurrent();
+    }
+
+    NSTimeInterval elapsed = CFAbsoluteTimeGetCurrent() - self.handoffStarted;
+    CGFloat progress = (CGFloat)MIN(MAX(elapsed / kHandoffRamp, 0.0), 1.0);
+    float baseGain = [self gainForVolume:self.volume];
+    [[CrossfadeAudioMixer sharedMixer] setPrimaryGain:baseGain * sinf((CGFloat)(M_PI_2) * progress)];
+    [[CrossfadeAudioMixer sharedMixer] setIncomingGain:baseGain * cosf((CGFloat)(M_PI_2) * progress)];
 
     if (progress >= 1.0) {
-        [self stop:self.incoming];
+        [[CrossfadeAudioMixer sharedMixer] stopIncomingPlayer:self.incoming];
         self.incoming = nil;
         self.incomingMedia = nil;
-        self.outgoingMedia = nil;
         self.fading = NO;
         self.transitionPending = NO;
         self.handoffFading = NO;
         [self stopHandoffTimer];
         [self startTimer];
     }
+}
+
+- (void)abandonHandoffAndRestorePrimary
+{
+    [[CrossfadeAudioMixer sharedMixer] stopIncomingPlayer:self.incoming];
+    self.incoming = nil;
+    self.incomingMedia = nil;
+    self.fading = NO;
+    self.transitionPending = NO;
+    self.handoffFading = NO;
+    [[CrossfadeAudioMixer sharedMixer] setPrimaryActive:YES];
+    [[CrossfadeAudioMixer sharedMixer] setPrimaryGain:[self gainForVolume:self.volume]];
+    [[CrossfadeAudioMixer sharedMixer] setIncomingGain:0.0];
+    [self stopHandoffTimer];
+    [self startTimer];
 }
 
 - (id)nextMedia
@@ -332,17 +402,21 @@ static const NSTimeInterval kHandoffWindow = 0.35;
     }
 }
 
-- (void)begin:(id)media outgoing:(id)outgoing duration:(NSTimeInterval)duration
+- (BOOL)begin:(id)media duration:(NSTimeInterval)duration
 {
-    if (self.fading || self.incoming || !media || !outgoing)
-        return;
+    if (self.fading || self.incoming || !media || !self.primary)
+        return NO;
+
+    if (![self boolValue:self.primary key:@"seekable" defaultValue:NO])
+        return NO;
 
     id player = [self makePlayer:media];
     if (!player)
-        return;
+        return NO;
 
-    @try { self.outgoingMedia = [outgoing valueForKey:@"media"]; }
-    @catch (__unused NSException *exception) { self.outgoingMedia = nil; }
+    if (![[CrossfadeAudioMixer sharedMixer] prepareIncomingPlayer:player])
+        return NO;
+
     self.incomingMedia = media;
     self.incoming = player;
     self.fadeDuration = duration;
@@ -350,9 +424,23 @@ static const NSTimeInterval kHandoffWindow = 0.35;
     self.transitionPending = NO;
     self.handoffFading = NO;
 
-    [self setVolume:0 player:player];
-    [self mutePrimary];
+    [[CrossfadeAudioMixer sharedMixer] setIncomingActive:YES];
+    [[CrossfadeAudioMixer sharedMixer] setPrimaryGain:[self gainForVolume:self.volume]];
+    [[CrossfadeAudioMixer sharedMixer] setIncomingGain:0.0];
     [self call:player sel:@selector(play)];
+    return YES;
+}
+
+- (id)servicePlayer
+{
+    id player = nil;
+    @try { player = [self.service valueForKey:@"_mediaPlayer"]; }
+    @catch (__unused NSException *exception) {}
+    if (!player) {
+        @try { player = [self.service valueForKey:@"mediaPlayer"]; }
+        @catch (__unused NSException *exception) {}
+    }
+    return player;
 }
 
 - (id)makePlayer:(id)media
@@ -366,8 +454,8 @@ static const NSTimeInterval kHandoffWindow = 0.35;
         id player = nil;
         if (library) {
             id allocated = [playerClass alloc];
-            id (*initWithLibrary)(id, SEL, id) = (void *)objc_msgSend;
-            player = initWithLibrary(allocated, @selector(initWithLibrary:), library);
+            id (*initializer)(id, SEL, id) = (void *)objc_msgSend;
+            player = initializer(allocated, @selector(initWithLibrary:), library);
         }
         if (!player)
             player = [[playerClass alloc] init];
@@ -378,13 +466,12 @@ static const NSTimeInterval kHandoffWindow = 0.35;
         @try { [player setValue:@(-1) forKey:@"currentVideoTrackIndex"]; }
         @catch (__unused NSException *exception) {}
 
-        float rate = 1.0;
+        float rate = 1.0f;
         @try { rate = [[self.primary valueForKey:@"rate"] floatValue]; }
         @catch (__unused NSException *exception) {}
-        if (rate > 0.0)
+        if (rate > 0.0f)
             [player setValue:@(rate) forKey:@"rate"];
 
-        [self setVolume:0 player:player];
         return player;
     }
     @catch (__unused NSException *exception) {
@@ -395,11 +482,12 @@ static const NSTimeInterval kHandoffWindow = 0.35;
 - (NSTimeInterval)remaining:(id)player
 {
     @try {
-        double total = [[[player valueForKey:@"media"] valueForKey:@"length"] doubleValue] / 1000.0;
+        id media = [player valueForKey:@"media"];
+        double total = [[media valueForKey:@"length"] doubleValue] / 1000.0;
         double current = [[player valueForKey:@"time"] doubleValue] / 1000.0;
         float rate = [[player valueForKey:@"rate"] floatValue];
-        if (rate <= 0.0)
-            rate = 1.0;
+        if (rate <= 0.0f)
+            rate = 1.0f;
         if (total <= 0.0 || current < 0.0 || current > total)
             return DBL_MAX;
         return MAX(0.0, (total - current) / rate);
@@ -420,42 +508,49 @@ static const NSTimeInterval kHandoffWindow = 0.35;
     }
 }
 
+- (id)mediaOf:(id)player
+{
+    @try { return [player valueForKey:@"media"]; }
+    @catch (__unused NSException *exception) { return nil; }
+}
+
+- (void)setTime:(NSTimeInterval)seconds player:(id)player
+{
+    if (!player || seconds < 0.0)
+        return;
+
+    @try {
+        Class timeClass = NSClassFromString(@"VLCTime");
+        if (!timeClass)
+            return;
+
+        id (*factory)(id, SEL, id) = (void *)objc_msgSend;
+        id time = factory(timeClass, @selector(timeWithNumber:), @(llround(seconds * 1000.0)));
+        [player setValue:time forKey:@"time"];
+    }
+    @catch (__unused NSException *exception) {}
+}
+
+- (BOOL)boolValue:(id)object key:(NSString *)key defaultValue:(BOOL)fallback
+{
+    @try { return [object valueForKey:key] ? [[object valueForKey:key] boolValue] : fallback; }
+    @catch (__unused NSException *exception) { return fallback; }
+}
+
 - (NSInteger)volumeOf:(id)player
 {
     if (!player)
         return self.volume;
 
     @try {
-        return MIN(MAX([[[player valueForKey:@"audio"] valueForKey:@"volume"] integerValue], 0), 200);
+        NSInteger value = [[[[player valueForKey:@"audio"] valueForKey:@"volume"] description] integerValue];
+        if (value < 0)
+            return self.volume;
+        return MIN(MAX(value, 0), 200);
     }
     @catch (__unused NSException *exception) {
         return self.volume;
     }
-}
-
-- (void)setVolume:(NSInteger)value player:(id)player
-{
-    if (!player)
-        return;
-
-    @try {
-        self.internalVolume = YES;
-        [[player valueForKey:@"audio"] setValue:@(MIN(MAX(value, 0), 200)) forKey:@"volume"];
-        self.internalVolume = NO;
-    }
-    @catch (__unused NSException *exception) {
-        self.internalVolume = NO;
-    }
-}
-
-- (void)mutePrimary
-{
-    [self setVolume:0 player:self.primary];
-}
-
-- (void)unmutePrimary
-{
-    [self setVolume:self.volume player:self.primary];
 }
 
 - (void)stop:(id)player
@@ -473,21 +568,22 @@ static const NSTimeInterval kHandoffWindow = 0.35;
     function(object, selector);
 }
 
-- (void)cancel:(BOOL)restore
+- (void)cancelTransition:(BOOL)restore
 {
     [self stopHandoffTimer];
-    [self setVolume:0 player:self.incoming];
-    [self stop:self.incoming];
+    [[CrossfadeAudioMixer sharedMixer] stopIncomingPlayer:self.incoming];
 
     self.incoming = nil;
     self.incomingMedia = nil;
-    self.outgoingMedia = nil;
     self.fading = NO;
     self.transitionPending = NO;
     self.handoffFading = NO;
 
-    if (restore)
-        [self unmutePrimary];
+    [[CrossfadeAudioMixer sharedMixer] setIncomingGain:0.0];
+    if (restore) {
+        [[CrossfadeAudioMixer sharedMixer] setPrimaryActive:YES];
+        [[CrossfadeAudioMixer sharedMixer] setPrimaryGain:[self gainForVolume:self.volume]];
+    }
 }
 
 - (void)settingsChanged:(NSNotification *)notification
@@ -495,7 +591,7 @@ static const NSTimeInterval kHandoffWindow = 0.35;
     (void)notification;
     dispatch_async(dispatch_get_main_queue(), ^{
         if ([self duration] <= 0.0)
-            [self cancel:YES];
+            [self cancelTransition:YES];
         else
             [self startTimer];
     });
@@ -513,8 +609,8 @@ static const NSTimeInterval kHandoffWindow = 0.35;
 - (void)routeChanged:(NSNotification *)notification
 {
     (void)notification;
-    if (self.fading || self.incoming)
-        [self cancel:YES];
+    if (self.fading || self.incoming || self.transitionPending)
+        [self cancelTransition:YES];
 }
 
 @end
