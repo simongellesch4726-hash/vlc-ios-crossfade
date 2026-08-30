@@ -9,6 +9,7 @@
 - (void)playbackPaused:(BOOL)paused;
 - (void)manualNavigation;
 - (void)positionChanged;
-- (void)didMoveToNextMedia;
+- (void)primaryReachedEnd;
+- (void)primaryStateChanged;
 - (void)userVolumeChanged:(NSInteger)volume;
 @end
