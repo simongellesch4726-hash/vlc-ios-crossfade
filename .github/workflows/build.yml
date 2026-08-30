@@ -1,0 +1,48 @@
+name: Build Crossfade
+on:
+  push:
+    branches: ["crossfade-3.7.3"]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      THEOS: /home/runner/theos
+      THEOS_PACKAGE_SCHEME: roothide
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install RootHide Theos
+        run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
+      - name: Verify toolchain
+        run: |
+          set -euo pipefail
+          test -x "$THEOS/toolchain/linux/iphone/bin/clang"
+          "$THEOS/toolchain/linux/iphone/bin/clang" --version
+          find "$THEOS/sdks" -maxdepth 1 -type d -name 'iPhoneOS*.sdk' -print -quit
+      - name: Build package
+        run: |
+          set -euo pipefail
+          make clean
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide TARGET=iphone:clang:latest:15.0
+      - name: Verify artifacts
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(packages/*.deb)
+          dylibs=(.theos/obj/arm64/Crossfade.dylib)
+          test "${#debs[@]}" -eq 1
+          test "${#dylibs[@]}" -eq 1
+          dpkg-deb -I "${debs[0]}"
+          dpkg-deb -c "${debs[0]}"
+          file "${dylibs[0]}"
+          file "${debs[0]}"
+          ! dpkg-deb -c "${debs[0]}" | grep -E '(/jbroot|/var/jb)' || true
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Crossfade-arm64
+          path: |
+            packages/*.deb
+            .theos/obj/arm64/Crossfade.dylib

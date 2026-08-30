@@ -1,0 +1,8 @@
+{
+    entry = {
+        bundle = CrossfadePrefs;
+        cell = PSLinkCell;
+        isController = 1;
+        label = "Audio Crossfade";
+    };
+}

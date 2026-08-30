@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>PreferenceSpecifiers</key><array>
+<dict><key>Type</key><string>PSGroupSpecifier</string><key>FooterText</key><string>Audio-only overlap between consecutive VLC playlist items. 0 seconds disables crossfade.</string></dict>
+<dict><key>Type</key><string>PSMultiValueSpecifier</string><key>Title</key><string>Audio Crossfade</string><key>Key</key><string>CrossfadeDuration</string><key>DefaultValue</key><real>0</real><key>Titles</key><array><string>Off</string><string>1 second</string><string>2 seconds</string><string>3 seconds</string><string>4 seconds</string><string>5 seconds</string><string>6 seconds</string><string>7 seconds</string><string>8 seconds</string><string>9 seconds</string><string>10 seconds</string><string>11 seconds</string><string>12 seconds</string><string>13 seconds</string><string>14 seconds</string><string>15 seconds</string></array><key>Values</key><array><real>0</real><real>1</real><real>2</real><real>3</real><real>4</real><real>5</real><real>6</real><real>7</real><real>8</real><real>9</real><real>10</real><real>11</real><real>12</real><real>13</real><real>14</real><real>15</real></array></dict>
+</array></dict></plist>
