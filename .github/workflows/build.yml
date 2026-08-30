@@ -47,10 +47,10 @@ jobs:
           dpkg-deb -c "${tweak_deb[0]}"
           dpkg-deb -I "${pref_deb[0]}"
           dpkg-deb -c "${pref_deb[0]}"
-          dpkg-deb -c "${pref_deb[0]}" | grep -F '/Library/PreferenceLoader/Preferences/CrossfadePrefs.plist'
+          dpkg-deb -c "${tweak_deb[0]}" | grep -F '/Library/PreferenceLoader/Preferences/CrossfadePrefs.plist'
           dpkg-deb -c "${pref_deb[0]}" | grep -F '/Library/PreferenceBundles/CrossfadePrefs.bundle/'
-          ! dpkg-deb -c "${tweak_deb[0]}" | grep -E '(/jbroot|/var/jb)' || true
-          ! dpkg-deb -c "${pref_deb[0]}" | grep -E '(/jbroot|/var/jb)' || true
+          ! dpkg-deb -c "${tweak_deb[0]}" | grep -E '(/jbroot|/var/jb)'
+          ! dpkg-deb -c "${pref_deb[0]}" | grep -E '(/jbroot|/var/jb)'
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
