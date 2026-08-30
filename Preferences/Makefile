@@ -1,6 +1,7 @@
-ARCHS = arm64
+ARCHS = arm64e
 TARGET = iphone:clang:latest:15.0
 THEOS_PACKAGE_SCHEME = roothide
+THEOS_LAYOUT_DIR = ../layout
 
 include $(THEOS)/makefiles/common.mk
 
