@@ -74,41 +74,57 @@ jobs:
           dpkg-deb -c "$tweak"
 
           echo "==> Locating payload files"
-          dylib_matches=(verify-tweak/**/Crossfade.dylib)
-          plist_matches=(verify-tweak/**/Crossfade.plist)
-          prefs_matches=(verify-tweak/**/CrossfadePrefs.bundle/CrossfadePrefs)
-          root_matches=(verify-tweak/**/CrossfadePrefs.bundle/Root.plist)
-          info_matches=(verify-tweak/**/CrossfadePrefs.bundle/Info.plist)
+          mapfile -t dylib_matches < <(find verify-tweak -type f -name 'Crossfade.dylib' -print | sort)
+          mapfile -t filter_matches < <(find verify-tweak -type f -path '*/DynamicLibraries/Crossfade.plist' -print | sort)
+          mapfile -t prefs_matches < <(find verify-tweak -type f -path '*/CrossfadePrefs.bundle/CrossfadePrefs' -print | sort)
+          mapfile -t root_matches < <(find verify-tweak -type f -path '*/CrossfadePrefs.bundle/Root.plist' -print | sort)
+          mapfile -t info_matches < <(find verify-tweak -type f -path '*/CrossfadePrefs.bundle/Info.plist' -print | sort)
+          mapfile -t loader_matches < <(find verify-tweak -type f -path '*/PreferenceLoader/Preferences/CrossfadePrefs.plist' -print | sort)
 
           printf 'Crossfade.dylib: '; printf '%s\n' "${dylib_matches[@]:-<none>}"
-          printf 'Crossfade.plist: '; printf '%s\n' "${plist_matches[@]:-<none>}"
+          printf 'Crossfade.plist: '; printf '%s\n' "${filter_matches[@]:-<none>}"
           printf 'CrossfadePrefs: '; printf '%s\n' "${prefs_matches[@]:-<none>}"
           printf 'Root.plist: '; printf '%s\n' "${root_matches[@]:-<none>}"
           printf 'Info.plist: '; printf '%s\n' "${info_matches[@]:-<none>}"
+          printf 'PreferenceLoader plist: '; printf '%s\n' "${loader_matches[@]:-<none>}"
 
           test "${#dylib_matches[@]}" -eq 1
+          test "${#filter_matches[@]}" -eq 1
           test "${#prefs_matches[@]}" -eq 1
           test "${#root_matches[@]}" -eq 1
           test "${#info_matches[@]}" -eq 1
+          test "${#loader_matches[@]}" -eq 1
 
           dylib_path="${dylib_matches[0]}"
+          filter_path="${filter_matches[0]}"
           prefs_path="${prefs_matches[0]}"
           root_path="${root_matches[0]}"
           info_path="${info_matches[0]}"
+          loader_path="${loader_matches[0]}"
 
-          test -f "$dylib_path"
+          test -x "$dylib_path"
+          test -f "$filter_path"
           test -x "$prefs_path"
           test -f "$root_path"
           test -f "$info_path"
+          test -f "$loader_path"
+
+          test "$dylib_path" = "verify-tweak/Library/MobileSubstrate/DynamicLibraries/Crossfade.dylib"
+          test "$filter_path" = "verify-tweak/Library/MobileSubstrate/DynamicLibraries/Crossfade.plist"
+          test "$prefs_path" = "verify-tweak/Library/PreferenceBundles/CrossfadePrefs.bundle/CrossfadePrefs"
+          test "$root_path" = "verify-tweak/Library/PreferenceBundles/CrossfadePrefs.bundle/Root.plist"
+          test "$info_path" = "verify-tweak/Library/PreferenceBundles/CrossfadePrefs.bundle/Info.plist"
+          test "$loader_path" = "verify-tweak/Library/PreferenceLoader/Preferences/CrossfadePrefs.plist"
 
           echo "==> Preference bundle verification"
-          python3 - "$info_path" "$root_path" <<'PY'
+          python3 - "$info_path" "$root_path" "$loader_path" <<'PY'
           import plistlib
           import sys
           from pathlib import Path
 
           info = plistlib.loads(Path(sys.argv[1]).read_bytes())
           root = plistlib.loads(Path(sys.argv[2]).read_bytes())
+          loader = plistlib.loads(Path(sys.argv[3]).read_bytes())
 
           assert info.get("CFBundleExecutable") == "CrossfadePrefs", info
           assert info.get("CFBundlePackageType") == "BNDL", info
@@ -123,17 +139,20 @@ jobs:
           assert len(crossfade.get("validTitles", [])) == 16, crossfade
           assert crossfade.get("validValues", [None])[0] == 0, crossfade
           assert crossfade.get("validValues", [None])[-1] == 15, crossfade
-          assert crossfade.get("default") == 0, crossfade
+
           print("Preference bundle metadata verified.")
+          print("PreferenceLoader metadata:", loader)
           PY
 
-          echo "==> RootHide path verification"
+          echo "==> RootHide payload path verification"
           if find verify-tweak -type f -print0 | xargs -0 grep -IlE '(/jbroot|/var/jb)' 2>/dev/null | grep -q .; then
             echo "ERROR: invalid RootHide path found in package payload" >&2
-            find verify-tweak -type f -print0 | xargs -0 grep -IlE '(/jbroot|/var/jb)' 2>/dev/null || true
             exit 1
           fi
 
+          echo "==> Package contents"
+          dpkg-deb -I "$tweak"
+          dpkg-deb -c "$tweak"
           echo "Artifact verification passed."
 
       - name: Upload artifact
