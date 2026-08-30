@@ -59,6 +59,26 @@ jobs:
           test -f "verify-tweak/Library/PreferenceBundles/CrossfadePrefs.bundle/Info.plist"
           test -f "verify-tweak/Library/PreferenceBundles/CrossfadePrefs.bundle/Root.plist"
 
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+          bundle = Path("verify-tweak/Library/PreferenceBundles/CrossfadePrefs.bundle")
+          info = plistlib.loads((bundle / "Info.plist").read_bytes())
+          assert info.get("CFBundleExecutable") == "CrossfadePrefs", info
+          assert info.get("CFBundlePackageType") == "BNDL", info
+          assert info.get("NSPrincipalClass") == "CrossfadePrefsListController", info
+          root = plistlib.loads((bundle / "Root.plist").read_bytes())
+          specifiers = root.get("PreferenceSpecifiers")
+          assert isinstance(specifiers, list) and len(specifiers) >= 2, root
+          crossfade = next(x for x in specifiers if x.get("Key") == "CrossfadeDuration")
+          assert crossfade.get("Type") == "PSMultiValueSpecifier", crossfade
+          assert len(crossfade.get("Values", [])) == 16, crossfade
+          assert crossfade.get("Values", [None])[0] == 0, crossfade
+          assert crossfade.get("Values", [None])[-1] == 15, crossfade
+          assert crossfade.get("DefaultValue") == 0, crossfade
+          print("Preference bundle metadata and Root.plist verified.")
+          PY
+
           if find verify-tweak -type f -print0 | xargs -0 grep -IlE '(/jbroot|/var/jb)' 2>/dev/null | grep -q .; then
             echo "ERROR: invalid RootHide path found in package payload" >&2
             exit 1
