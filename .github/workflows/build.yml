@@ -21,29 +21,37 @@ jobs:
           test -x "$THEOS/toolchain/linux/iphone/bin/clang"
           "$THEOS/toolchain/linux/iphone/bin/clang" --version
           find "$THEOS/sdks" -maxdepth 1 -type d -name 'iPhoneOS*.sdk' -print -quit
-      - name: Build package
+      - name: Build Crossfade tweak
         run: |
-          set -euo pipefail
-          make clean
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide TARGET=iphone:clang:latest:15.0
+          set -euxo pipefail
+          make -C Crossfade clean
+          make -C Crossfade package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide TARGET=iphone:clang:latest:15.0
+      - name: Build preferences bundle
+        run: |
+          set -euxo pipefail
+          make -C Preferences clean
+          make -C Preferences package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide TARGET=iphone:clang:latest:15.0
       - name: Verify artifacts
         run: |
           set -euo pipefail
           shopt -s nullglob
-          debs=(packages/*.deb)
-          test "${#debs[@]}" -ge 1
-          crossfade_deb=(packages/com.videolan.vlc-ios.crossfade_*.deb)
-          test "${#crossfade_deb[@]}" -eq 1
-          test -f .theos/obj/arm64/Crossfade.dylib
-          dpkg-deb -I "${crossfade_deb[0]}"
-          dpkg-deb -c "${crossfade_deb[0]}"
-          file .theos/obj/arm64/Crossfade.dylib
-          file "${crossfade_deb[0]}"
-          ! dpkg-deb -c "${crossfade_deb[0]}" | grep -E '(/jbroot|/var/jb)' || true
-      - name: Upload package
+          tweak_deb=(Crossfade/packages/com.videolan.vlc-ios.crossfade_*.deb)
+          pref_deb=(Preferences/packages/*.deb)
+          test "${#tweak_deb[@]}" -eq 1
+          test "${#pref_deb[@]}" -eq 1
+          test -f Crossfade/.theos/obj/arm64/Crossfade.dylib
+          dpkg-deb -I "${tweak_deb[0]}"
+          dpkg-deb -c "${tweak_deb[0]}"
+          dpkg-deb -I "${pref_deb[0]}"
+          dpkg-deb -c "${pref_deb[0]}"
+          file Crossfade/.theos/obj/arm64/Crossfade.dylib
+          file "${tweak_deb[0]}"
+          ! dpkg-deb -c "${tweak_deb[0]}" | grep -E '(/jbroot|/var/jb)' || true
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Crossfade-arm64
           path: |
-            packages/*.deb
-            .theos/obj/arm64/Crossfade.dylib
+            Crossfade/packages/*.deb
+            Preferences/packages/*.deb
+            Crossfade/.theos/obj/arm64/Crossfade.dylib
