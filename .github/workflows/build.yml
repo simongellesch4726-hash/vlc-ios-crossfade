@@ -39,18 +39,50 @@ jobs:
           pref_deb=(Preferences/packages/*.deb)
           test "${#tweak_deb[@]}" -eq 1
           test "${#pref_deb[@]}" -eq 1
-          test -f Crossfade/.theos/obj/arm64e/Crossfade.dylib
-          file Crossfade/.theos/obj/arm64e/Crossfade.dylib
-          file "${tweak_deb[0]}"
-          file "${pref_deb[0]}"
-          dpkg-deb -I "${tweak_deb[0]}"
-          dpkg-deb -c "${tweak_deb[0]}"
-          dpkg-deb -I "${pref_deb[0]}"
-          dpkg-deb -c "${pref_deb[0]}"
-          dpkg-deb -c "${tweak_deb[0]}" | grep -F '/Library/PreferenceLoader/Preferences/CrossfadePrefs.plist'
-          dpkg-deb -c "${pref_deb[0]}" | grep -F '/Library/PreferenceBundles/CrossfadePrefs.bundle/'
-          ! dpkg-deb -c "${tweak_deb[0]}" | grep -E '(/jbroot|/var/jb)'
-          ! dpkg-deb -c "${pref_deb[0]}" | grep -E '(/jbroot|/var/jb)'
+
+          tweak="${tweak_deb[0]}"
+          pref="${pref_deb[0]}"
+          dylib="Crossfade/.theos/obj/arm64e/Crossfade.dylib"
+          test -f "$dylib"
+
+          echo "==> Mach-O verification"
+          file "$dylib"
+          macho_info="$(file "$dylib")"
+          case "$macho_info" in
+            *"Mach-O 64-bit arm64e"*) ;;
+            *) echo "ERROR: Crossfade.dylib is not arm64e: $macho_info" >&2; exit 1 ;;
+          esac
+
+          echo "==> Debian metadata verification"
+          test "$(dpkg-deb -f "$tweak" Package)" = "com.videolan.vlc-ios.crossfade"
+          test "$(dpkg-deb -f "$tweak" Architecture)" = "iphoneos-arm64e"
+          test "$(dpkg-deb -f "$pref" Package)" = "com.videolan.vlc-ios.crossfade.preferences"
+          test "$(dpkg-deb -f "$pref" Architecture)" = "iphoneos-arm64e"
+
+          echo "==> Package payload verification"
+          rm -rf verify-tweak verify-pref
+          mkdir -p verify-tweak verify-pref
+          dpkg-deb -x "$tweak" verify-tweak
+          dpkg-deb -x "$pref" verify-pref
+
+          test -f "verify-tweak/Library/MobileSubstrate/DynamicLibraries/Crossfade.dylib"
+          test -f "verify-tweak/Library/MobileSubstrate/DynamicLibraries/Crossfade.plist"
+          test -f "verify-tweak/Library/PreferenceLoader/Preferences/CrossfadePrefs.plist"
+          test -x "verify-pref/Library/PreferenceBundles/CrossfadePrefs.bundle/CrossfadePrefs"
+          test -f "verify-pref/Library/PreferenceBundles/CrossfadePrefs.bundle/Info.plist"
+          test -f "verify-pref/Library/PreferenceBundles/CrossfadePrefs.bundle/Root.plist"
+
+          if find verify-tweak verify-pref -type f -print0 | xargs -0 grep -IlE '(/jbroot|/var/jb)' 2>/dev/null | grep -q .; then
+            echo "ERROR: invalid RootHide path found in package payload" >&2
+            exit 1
+          fi
+
+          echo "==> Package contents"
+          dpkg-deb -I "$tweak"
+          dpkg-deb -c "$tweak"
+          dpkg-deb -I "$pref"
+          dpkg-deb -c "$pref"
+          echo "Artifact verification passed."
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
