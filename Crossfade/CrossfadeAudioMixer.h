@@ -4,13 +4,17 @@
 
 + (instancetype)sharedMixer;
 
-- (BOOL)attachPrimaryPlayer:(id)primary;
-- (BOOL)prepareIncomingPlayer:(id)incoming;
+- (BOOL)attachPrimaryPlayer:(id)player;
+- (BOOL)preparePrimaryPlayer:(id)player;
+- (BOOL)prepareIncomingPlayer:(id)player;
+
 - (void)setPrimaryGain:(float)gain;
 - (void)setIncomingGain:(float)gain;
 - (void)setPrimaryActive:(BOOL)active;
 - (void)setIncomingActive:(BOOL)active;
-- (void)stopIncomingPlayer:(id)incoming;
+
+- (void)stopPrimaryPlayer:(id)player;
+- (void)stopIncomingPlayer:(id)player;
 - (void)detach;
 
 @end
