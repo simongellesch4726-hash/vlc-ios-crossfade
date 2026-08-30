@@ -1,31 +1,38 @@
 name: Build Crossfade
+
 on:
   push:
     branches: ["crossfade-3.7.3"]
   pull_request:
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
       THEOS: /home/runner/theos
       THEOS_PACKAGE_SCHEME: roothide
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Install RootHide Theos
         run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
+
       - name: Verify toolchain
         run: |
           set -euo pipefail
           test -x "$THEOS/toolchain/linux/iphone/bin/clang"
           "$THEOS/toolchain/linux/iphone/bin/clang" --version
           find "$THEOS/sdks" -maxdepth 1 -type d -name 'iPhoneOS*.sdk' -print -quit
+
       - name: Build Crossfade package
         run: |
           set -euxo pipefail
           make -C Crossfade clean
-          make -C Crossfade package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide TARGET=iphone:clang:latest:15.0
+          make -C Crossfade package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide TARGET=iphone:clang:latest:15.0 ARCHS=arm64e
+
       - name: Verify artifact
         run: |
           set -euo pipefail
@@ -33,15 +40,24 @@ jobs:
           tweak_deb=(Crossfade/packages/com.videolan.vlc-ios.crossfade_*.deb)
           test "${#tweak_deb[@]}" -eq 1
           tweak="${tweak_deb[0]}"
+
           dylib="Crossfade/.theos/obj/arm64e/Crossfade.dylib"
+          prefs_binary="Crossfade/.theos/obj/arm64e/CrossfadePrefs.bundle/CrossfadePrefs"
           test -f "$dylib"
+          test -f "$prefs_binary"
 
           echo "==> Mach-O verification"
-          macho_info="$(file "$dylib")"
-          echo "$macho_info"
-          case "$macho_info" in
+          tweak_macho_info="$(file "$dylib")"
+          prefs_macho_info="$(file "$prefs_binary")"
+          echo "$tweak_macho_info"
+          echo "$prefs_macho_info"
+          case "$tweak_macho_info" in
             *"Mach-O 64-bit arm64e"*) ;;
             *) echo "ERROR: Crossfade.dylib is not arm64e" >&2; exit 1 ;;
+          esac
+          case "$prefs_macho_info" in
+            *"Mach-O 64-bit arm64e"*) ;;
+            *) echo "ERROR: CrossfadePrefs is not arm64e" >&2; exit 1 ;;
           esac
 
           echo "==> Debian metadata verification"
@@ -54,7 +70,7 @@ jobs:
           dpkg-deb -x "$tweak" verify-tweak
           test -f "verify-tweak/Library/MobileSubstrate/DynamicLibraries/Crossfade.dylib"
           test -f "verify-tweak/Library/MobileSubstrate/DynamicLibraries/Crossfade.plist"
-          test -f "verify-tweak/Library/PreferenceLoader/Preferences/CrossfadePrefs.plist"
+          test -f "verify-tweak/Library/PreferenceLoader/Preferences/Crossfade.plist"
           test -x "verify-tweak/Library/PreferenceBundles/CrossfadePrefs.bundle/CrossfadePrefs"
           test -f "verify-tweak/Library/PreferenceBundles/CrossfadePrefs.bundle/Info.plist"
           test -f "verify-tweak/Library/PreferenceBundles/CrossfadePrefs.bundle/Root.plist"
@@ -62,20 +78,27 @@ jobs:
           python3 - <<'PY'
           import plistlib
           from pathlib import Path
+
           bundle = Path("verify-tweak/Library/PreferenceBundles/CrossfadePrefs.bundle")
           info = plistlib.loads((bundle / "Info.plist").read_bytes())
           assert info.get("CFBundleExecutable") == "CrossfadePrefs", info
           assert info.get("CFBundlePackageType") == "BNDL", info
           assert info.get("NSPrincipalClass") == "CrossfadePrefsListController", info
+
           root = plistlib.loads((bundle / "Root.plist").read_bytes())
-          specifiers = root.get("PreferenceSpecifiers")
-          assert isinstance(specifiers, list) and len(specifiers) >= 2, root
-          crossfade = next(x for x in specifiers if x.get("Key") == "CrossfadeDuration")
-          assert crossfade.get("Type") == "PSMultiValueSpecifier", crossfade
-          assert len(crossfade.get("Values", [])) == 16, crossfade
-          assert crossfade.get("Values", [None])[0] == 0, crossfade
-          assert crossfade.get("Values", [None])[-1] == 15, crossfade
-          assert crossfade.get("DefaultValue") == 0, crossfade
+          items = root.get("items")
+          assert isinstance(items, list) and len(items) >= 2, root
+
+          crossfade = next((x for x in items if x.get("key") == "CrossfadeDuration"), None)
+          assert crossfade is not None, items
+          assert crossfade.get("cell") == "PSLinkListCell", crossfade
+          assert crossfade.get("detail") == "PSListItemsController", crossfade
+          assert crossfade.get("defaults") == "org.videolan.vlc-ios", crossfade
+          assert len(crossfade.get("validValues", [])) == 16, crossfade
+          assert len(crossfade.get("validTitles", [])) == 16, crossfade
+          assert crossfade.get("validValues", [None])[0] == 0, crossfade
+          assert crossfade.get("validValues", [None])[-1] == 15, crossfade
+          assert crossfade.get("default") == 0, crossfade
           print("Preference bundle metadata and Root.plist verified.")
           PY
 
@@ -88,6 +111,7 @@ jobs:
           dpkg-deb -I "$tweak"
           dpkg-deb -c "$tweak"
           echo "Artifact verification passed."
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -95,3 +119,4 @@ jobs:
           path: |
             Crossfade/packages/*.deb
             Crossfade/.theos/obj/arm64e/Crossfade.dylib
+            Crossfade/.theos/obj/arm64e/CrossfadePrefs.bundle/CrossfadePrefs
